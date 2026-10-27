@@ -6,6 +6,7 @@
   <title>Water Sentry - Smart Leak Detection & Hydrodynamics</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
   <!-- Phosphor Icons for intuitive universal visual cues -->
   <script src="https://unpkg.com/@phosphor-icons/web"></script>
   <script>
@@ -106,6 +107,20 @@
   </div>
 
   <main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+
+    <!-- LIVE HARDWARE CONNECTION CARD -->
+    <div id="live-card" class="p-4 rounded-2xl border-2 border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm">
+      <div class="flex items-center gap-3">
+        <span id="live-dot" class="w-4 h-4 rounded-full bg-slate-400 inline-block"></span>
+        <div>
+          <p id="live-status" class="font-black text-sm">Demo Mode (simulated data)</p>
+          <p id="live-sub" class="text-xs text-slate-500 dark:text-slate-400">Turn on Live Mode to read real sensors from the ESP32.</p>
+        </div>
+      </div>
+      <button id="live-btn" onclick="toggleLive()" class="touch-target px-5 py-3 rounded-2xl bg-cyan-600 hover:bg-cyan-700 active:scale-95 text-white font-black text-sm flex items-center justify-center gap-2 shadow-md">
+        <i class="ph-fill ph-broadcast text-lg"></i><span id="live-btn-label">Start Live Mode</span>
+      </button>
+    </div>
 
     <!-- Top Master Status Card: Clear Visual Symbol for Low Literacy -->
     <div id="master-status-card" class="p-6 rounded-3xl border-4 transition-all duration-500 shadow-xl bg-white dark:bg-slate-900 border-emerald-500 flex flex-col md:flex-row items-center justify-between gap-6">
@@ -719,9 +734,19 @@
     /* =========================================================================
        5. CORE ZONE TRANSITIONS & HYDRODYNAMICS
        ========================================================================= */
-    function setZone(zone) {
+    function setZone(zone, fromSensor = false) {
+      if (LIVE.on && !fromSensor) {
+        showToast("Live Mode is ON. Stop Live Mode to use the demo buttons.");
+        return;
+      }
       STATE.currentZone = zone;
 
+      if (fromSensor) {
+        // Real sensor values are already in STATE - only set alerts
+        STATE.leakProbability = { A: 4, B: 68, C: 89, D: 99 }[zone];
+        if (zone === 'D') startEmergencySiren();
+        else { stopEmergencySiren(); if (zone === 'A') playSafeChime(); else playWarningBeep(); }
+      } else
       // Adjust physical parameters based on simulated hydrodynamic states
       if (zone === 'A') {
         stopEmergencySiren();
@@ -753,7 +778,7 @@
       }
 
       // If valve was closed, shut down flow to 0
-      if (STATE.valveClosed) {
+      if (STATE.valveClosed && !fromSensor) {
         STATE.flowRate = 0;
         STATE.pressure = 10;
       }
@@ -924,6 +949,14 @@
        7. EMERGENCY VALVE TOGGLE
        ========================================================================= */
     function toggleValve() {
+      if (LIVE.on) {                       // REAL valve: send command, wait for ESP32 confirmation
+        if (!LIVE.connected) { showToast("Not connected to the broker yet."); return; }
+        const cmd = STATE.valveClosed ? 'open' : 'close';
+        LIVE.client.publish(LIVE.TOPIC_VALVE, cmd, { qos: 1 });
+        showToast(cmd === 'close' ? "Sending CLOSE command to valve..." : "Sending OPEN command to valve...");
+        logEvent("Command sent to valve: " + cmd.toUpperCase(), "Action");
+        return;
+      }
       STATE.valveClosed = !STATE.valveClosed;
       const lang = DICTIONARY[STATE.language] || DICTIONARY.en;
 
@@ -996,6 +1029,120 @@
     }
 
     /* =========================================================================
+       LIVE MODE: REAL SENSORS + VALVE THROUGH MQTT
+       ========================================================================= */
+    const DEVICE_ID = "watersentry_aditya_2026";   // must be the SAME in the ESP32 code
+    const LIVE_LEAK_MINUTES = 30;                  // slow trickle this long = Zone B (use 0.2 for a quick test)
+    const LIVE = {
+      on: false, connected: false, client: null, lastSeen: 0, trickleStart: null, offlineShown: false,
+      TOPIC_DATA:  DEVICE_ID + "/data",
+      TOPIC_VALVE: DEVICE_ID + "/valve",
+      TOPIC_STATE: DEVICE_ID + "/valvestate"
+    };
+
+    function setLiveStatus(color, title, sub) {
+      document.getElementById('live-dot').className = "w-4 h-4 rounded-full inline-block " + color;
+      document.getElementById('live-status').textContent = title;
+      document.getElementById('live-sub').textContent = sub;
+    }
+
+    function liveZone(flow, psi) {
+      if (flow >= 100 || (psi < 25 && flow > 60)) return 'D';          // burst
+      if (psi > 75) return 'C';                                         // dangerous pressure
+      if (flow >= 0.3 && flow <= 5) {                                   // slow trickle
+        if (!LIVE.trickleStart) LIVE.trickleStart = Date.now();
+        if ((Date.now() - LIVE.trickleStart) / 60000 >= LIVE_LEAK_MINUTES) return 'B';
+      } else {
+        LIVE.trickleStart = null;
+      }
+      return (STATE.currentZone === 'B' && LIVE.trickleStart) ? 'B' : 'A';
+    }
+
+    function onLiveMessage(topic, payload) {
+      let msg;
+      try { msg = JSON.parse(payload.toString()); } catch (e) { return; }
+
+      if (topic === LIVE.TOPIC_STATE) {                // ESP32 confirms valve position
+        const closed = msg.state === 'closed';
+        if (closed !== STATE.valveClosed) {
+          STATE.valveClosed = closed;
+          if (closed) stopEmergencySiren();
+          const lang = DICTIONARY[STATE.language] || DICTIONARY.en;
+          showToast(closed ? lang.valveClosedAlert : lang.valveOpenAlert);
+          logEvent(closed ? "Valve CLOSED (confirmed by hardware)" : "Valve OPENED (confirmed by hardware)", "Action");
+          updateUI();
+        }
+        return;
+      }
+
+      // topic === data:  { flow: L/min, psi: PSI, level: % }
+      LIVE.lastSeen = Date.now();
+      if (LIVE.offlineShown) {
+        LIVE.offlineShown = false;
+        logEvent("Sensors are back online", "Info");
+      }
+      setLiveStatus("bg-emerald-500 animate-pulse", "LIVE - receiving sensor data", "Last update: " + new Date().toLocaleTimeString());
+
+      STATE.flowRate = Math.round(msg.flow * 10) / 10;
+      STATE.pressure = Math.round(msg.psi);
+      if (msg.level >= 0) STATE.tankLevel = Math.round(msg.level);   // -1 = ultrasonic read error
+
+      const zone = liveZone(STATE.flowRate, STATE.pressure);
+      if (zone !== STATE.currentZone) setZone(zone, true);   // alerts: siren, voice, vibration, banner
+      else updateUI();
+    }
+
+    function toggleLive() {
+      getAudioContext();                               // user tap unlocks sound
+      if (!LIVE.on) {
+        if (typeof mqtt === 'undefined') { showToast("MQTT library did not load. Check internet."); return; }
+        LIVE.on = true;
+        document.getElementById('live-btn-label').textContent = "Stop Live Mode";
+        setLiveStatus("bg-amber-500 animate-pulse", "Connecting to broker...", "Waiting for the ESP32 to send data.");
+        LIVE.client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt", {
+          clientId: "ws_" + Math.random().toString(16).slice(2), reconnectPeriod: 3000
+        });
+        LIVE.client.on('connect', () => {
+          LIVE.connected = true;
+          LIVE.client.subscribe([LIVE.TOPIC_DATA, LIVE.TOPIC_STATE]);
+          setLiveStatus("bg-amber-500 animate-pulse", "Connected - waiting for sensors", "Make sure the ESP32 is powered and on Wi-Fi.");
+          logEvent("Connected to broker. Live Mode ON", "Info");
+        });
+        LIVE.client.on('close', () => {
+          LIVE.connected = false;
+          if (LIVE.on) setLiveStatus("bg-red-500", "Broker disconnected", "Trying to reconnect...");
+        });
+        LIVE.client.on('message', onLiveMessage);
+      } else {
+        LIVE.on = false; LIVE.connected = false; LIVE.lastSeen = 0; LIVE.trickleStart = null;
+        if (LIVE.client) { LIVE.client.end(true); LIVE.client = null; }
+        document.getElementById('live-btn-label').textContent = "Start Live Mode";
+        setLiveStatus("bg-slate-400", "Demo Mode (simulated data)", "Turn on Live Mode to read real sensors from the ESP32.");
+        logEvent("Live Mode OFF. Back to demo", "Info");
+        resetSimulation();
+      }
+    }
+
+    // If no data for 15 seconds, warn: the sensor or Wi-Fi may be down
+    setInterval(() => {
+      if (LIVE.on && LIVE.lastSeen && Date.now() - LIVE.lastSeen > 15000 && !LIVE.offlineShown) {
+        LIVE.offlineShown = true;
+        setLiveStatus("bg-red-500", "SENSORS OFFLINE", "No data for 15 seconds. Check ESP32 power and Wi-Fi.");
+        logEvent("No sensor data for 15 seconds", "C");
+        showToast("Warning: sensors offline!");
+        playWarningBeep();
+        speakCustom("Warning. Sensors are offline.");
+      }
+    }, 5000);
+
+    function speakCustom(text) {
+      if (!('speechSynthesis' in window)) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = STATE.language === 'hi' ? 'hi-IN' : 'en-US';
+      window.speechSynthesis.speak(u);
+    }
+
+    /* =========================================================================
        9. EVENT LISTENERS & INITIALIZATION
        ========================================================================= */
     window.addEventListener('DOMContentLoaded', () => {
@@ -1053,7 +1200,7 @@
 
       // Subtle dynamic fluctuations to mimic live telemetry
       setInterval(() => {
-        if (!STATE.valveClosed && STATE.currentZone === 'A') {
+        if (!LIVE.on && !STATE.valveClosed && STATE.currentZone === 'A') {
           // Small random drift for natural feel
           const jitter = (Math.random() - 0.5) * 2;
           STATE.flowRate = Math.round(Math.max(22, Math.min(30, 26 + jitter)));
